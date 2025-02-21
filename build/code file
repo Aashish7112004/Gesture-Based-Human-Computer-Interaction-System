@@ -1,1 +1,182 @@
+import cv2
+import mediapipe as mp
+import pyautogui
+import time
+
+# Initialize MediaPipe and PyAutoGUI
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.6)
+mp_draw = mp.solutions.drawing_utils
+pyautogui.FAILSAFE = False  # Prevents the fail-safe exception
+
+# Screen and camera dimensions
+screen_width, screen_height = pyautogui.size()
+cam_width, cam_height = 640, 480
+
+# Capture video from the webcam
+cap = cv2.VideoCapture(0)
+cap.set(3, cam_width)
+cap.set(4, cam_height)
+
+# Sensitivity and smoothing parameters
+sensitivity = 1.5
+smoothing_factor = 0.2
+max_displacement = 0.2
+
+# Initial mouse and hand positions
+current_mouse_x, current_mouse_y = pyautogui.position()
+anchor_hand_x, anchor_hand_y = None, None
+hand_active = False
+
+# Click state trackers
+left_click_executed = False
+right_click_executed = False
+double_click_executed = False
+double_click_threshold = 0.3  # seconds for stability before double click
+double_click_start = None
+
+def count_fingers(hand_landmarks):
+    """Counts the number of fingers that are up."""
+    finger_tips = [8, 12, 16, 20]
+    finger_pips = [6, 10, 14, 18]
+    thumb_tip = 4
+    thumb_ip = 3
+
+    fingers_up = 0
+    # Check thumb
+    if hand_landmarks.landmark[thumb_tip].x < hand_landmarks.landmark[thumb_ip].x:
+        fingers_up += 1
+    # Check other fingers
+    for tip, pip in zip(finger_tips, finger_pips):
+        if hand_landmarks.landmark[tip].y < hand_landmarks.landmark[pip].y:
+            fingers_up += 1
+    return fingers_up
+
+def get_finger_states(hand_landmarks):
+    """Determines which fingers are up or down.
+       Returns a list of 5 values for [Thumb, Index, Middle, Ring, Pinky],
+       where 1 means the finger is up and 0 means it is down.
+    """
+    finger_tips = [4, 8, 12, 16, 20]
+    finger_states = []
+    # Thumb: Compare x-coordinates (for right hand)
+    if hand_landmarks.landmark[finger_tips[0]].x < hand_landmarks.landmark[finger_tips[0] - 2].x:
+        finger_states.append(1)
+    else:
+        finger_states.append(0)
+    # Other fingers: Compare y-coordinates
+    for tip in finger_tips[1:]:
+        if hand_landmarks.landmark[tip].y < hand_landmarks.landmark[tip - 2].y:
+            finger_states.append(1)
+        else:
+            finger_states.append(0)
+    return finger_states
+
+while True:
+    success, img = cap.read()
+    if not success:
+        print("Failed to capture image")
+        break
+
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    results = hands.process(img_rgb)
+
+    if results.multi_hand_landmarks:
+        for hand_landmarks in results.multi_hand_landmarks:
+            mp_draw.draw_landmarks(img, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            finger_states = get_finger_states(hand_landmarks)
+            finger_count = count_fingers(hand_landmarks)
+
+            index_tip = hand_landmarks.landmark[8]
+            middle_tip = hand_landmarks.landmark[12]
+
+            # Compute average hand position based on index and middle fingertips
+            hand_x = (index_tip.x + middle_tip.x) / 2
+            hand_y = (index_tip.y + middle_tip.y) / 2
+
+            # --- Reset state when all five fingers are up ---
+            if finger_count == 5:
+                hand_active = False
+                left_click_executed = False
+                right_click_executed = False
+                double_click_executed = False
+                double_click_start = None
+            # --- Double-click: Both index and middle fingers are down ---
+            elif finger_states[1] == 0 and finger_states[2] == 0:
+                # Prevent pointer movement during double-click
+                hand_active = False
+                if double_click_start is None:
+                    double_click_start = time.time()
+                elif (time.time() - double_click_start) >= double_click_threshold:
+                    if not double_click_executed:
+                        pyautogui.doubleClick()
+                        double_click_executed = True
+                        left_click_executed = False
+                        right_click_executed = False
+            # --- Left-click: Only index finger is down (middle finger up) ---
+            elif finger_states[1] == 0 and finger_states[2] == 1:
+                double_click_start = None  # Reset double-click timer
+                hand_active = False
+                if not left_click_executed:
+                    pyautogui.click()
+                    left_click_executed = True
+                    right_click_executed = False
+                    double_click_executed = False
+            # --- Right-click: Only middle finger is down (index finger up) ---
+            elif finger_states[1] == 1 and finger_states[2] == 0:
+                double_click_start = None  # Reset double-click timer
+                hand_active = False
+                if not right_click_executed:
+                    pyautogui.rightClick()
+                    right_click_executed = True
+                    left_click_executed = False
+                    double_click_executed = False
+            # --- Mouse Movement: When exactly 2 fingers are up and both index and middle are extended ---
+            elif finger_count == 2 and finger_states[1] == 1 and finger_states[2] == 1:
+                # Reset click states while moving and reset double-click timer
+                left_click_executed = False
+                right_click_executed = False
+                double_click_executed = False
+                double_click_start = None
+
+                if not hand_active:
+                    anchor_hand_x, anchor_hand_y = hand_x, hand_y
+                    hand_active = True
+
+                dx = hand_x - anchor_hand_x
+                dy = hand_y - anchor_hand_y
+
+                if abs(dx) > max_displacement or abs(dy) > max_displacement:
+                    anchor_hand_x, anchor_hand_y = hand_x, hand_y
+                    continue
+
+                screen_dx = dx * sensitivity * screen_width
+                screen_dy = dy * sensitivity * screen_height
+
+                new_mouse_x = current_mouse_x + screen_dx
+                new_mouse_y = current_mouse_y + screen_dy
+
+                new_mouse_x = int(current_mouse_x * (1 - smoothing_factor) + new_mouse_x * smoothing_factor)
+                new_mouse_y = int(current_mouse_y * (1 - smoothing_factor) + new_mouse_y * smoothing_factor)
+
+                new_mouse_x = max(0, min(screen_width - 1, new_mouse_x))
+                new_mouse_y = max(0, min(screen_height - 1, new_mouse_y))
+
+                pyautogui.moveTo(new_mouse_x, new_mouse_y)
+
+                current_mouse_x, current_mouse_y = new_mouse_x, new_mouse_y
+                anchor_hand_x, anchor_hand_y = hand_x, hand_y
+
+            # --- Visualization ---
+            index_x, index_y = int(index_tip.x * cam_width), int(index_tip.y * cam_height)
+            middle_x, middle_y = int(middle_tip.x * cam_width), int(middle_tip.y * cam_height)
+            cv2.circle(img, (index_x, index_y), 8, (255, 0, 0), -1)   # Blue circle for index finger
+            cv2.circle(img, (middle_x, middle_y), 8, (0, 255, 0), -1)   # Green circle for middle finger
+
+    cv2.imshow("Gesture Mouse Control", img)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
 
